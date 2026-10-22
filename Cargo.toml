@@ -1,0 +1,19 @@
+[package]
+name = "xone-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Low-latency multi-controller Xbox evdev/uinput relay over TCP with force feedback"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[features]
+bench = []
