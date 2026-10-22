@@ -73,6 +73,19 @@ cargo build --release
 
 ## Install
 
+Download the latest release archive on each machine:
+
+```sh
+curl -fLO https://github.com/johngrantdev/xone-relay/releases/latest/download/xone-relay-x86_64-linux-musl.tar.gz
+curl -fLO https://github.com/johngrantdev/xone-relay/releases/latest/download/xone-relay-x86_64-linux-musl.tar.gz.sha256
+sha256sum -c xone-relay-x86_64-linux-musl.tar.gz.sha256
+tar xzf xone-relay-x86_64-linux-musl.tar.gz
+cd xone-relay
+```
+
+The archive contains the static binary, install scripts, systemd units, and
+example configuration. It does not contain xone.
+
 ### On the sender system
 
 #### Requirements
@@ -91,12 +104,8 @@ allow that port instead.
 Install xone for the host kernel. Pair the adapter. Then run:
 
 ```sh
-./build.sh
 sudo ./install/sender.sh
 ```
-
-Or set `XONE_RELAY_BIN=/path/to/xone-relay` when the binary was built
-elsewhere.
 
 #### Fedora bootc images
 
@@ -108,7 +117,6 @@ xone and the sender as one host method.
 Install xone for the host kernel. Pair the adapter. Then run:
 
 ```sh
-./build.sh
 sudo ./install/sender.sh
 ```
 
@@ -126,6 +134,8 @@ PORT=47998
 if you change it.
 
 ### On the receiver system
+
+Download and extract the release archive on the receiver, then run:
 
 ```sh
 sudo ./install/receiver.sh

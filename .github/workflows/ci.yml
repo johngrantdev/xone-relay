@@ -40,7 +40,16 @@ jobs:
         run: sha256sum -c SHA256SUMS
 
       - name: Write checksum
-        run: sha256sum dist/xone-relay > dist/xone-relay.sha256
+        run: (cd dist && sha256sum xone-relay > xone-relay.sha256)
+
+      - name: Package release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p release/xone-relay/dist
+          cp -a README.md LICENSE SHA256SUMS config install systemd release/xone-relay/
+          cp dist/xone-relay release/xone-relay/dist/
+          tar -C release -czf dist/xone-relay-x86_64-linux-musl.tar.gz xone-relay
+          (cd dist && sha256sum xone-relay-x86_64-linux-musl.tar.gz > xone-relay-x86_64-linux-musl.tar.gz.sha256)
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -57,3 +66,5 @@ jobs:
           files: |
             dist/xone-relay
             dist/xone-relay.sha256
+            dist/xone-relay-x86_64-linux-musl.tar.gz
+            dist/xone-relay-x86_64-linux-musl.tar.gz.sha256
