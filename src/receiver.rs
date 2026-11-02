@@ -56,6 +56,18 @@ impl Session {
     }
 
     fn remove_device(&mut self, slot: u8) {
+        // Destroying the uinput device does not tell the sender, and the
+        // controller keeps playing whatever effect was last started. Erase
+        // them while there is still a connection to ask.
+        let local_ids: Vec<u16> = self
+            .effects
+            .keys()
+            .filter(|(effect_slot, _)| *effect_slot == slot)
+            .map(|(_, local_id)| *local_id)
+            .collect();
+        for local_id in local_ids {
+            let _ = self.send(&Message::FfErase { slot, local_id });
+        }
         if let Some(device) = self.devices.remove(&slot) {
             destroy_uinput(device.fd);
             eprintln!(

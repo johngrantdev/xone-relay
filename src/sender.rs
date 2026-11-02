@@ -174,9 +174,24 @@ impl Session {
         Ok(())
     }
 
+    // An effect the guest has gone away from is a rumble that never stops:
+    // erasing it is the only thing that ends it on the controller.
+    fn stop_effects(&mut self, slot: u8, fd: RawFd) {
+        let host_ids: Vec<u16> = self
+            .effects
+            .iter()
+            .filter(|((effect_slot, _), _)| *effect_slot == slot)
+            .map(|(_, host_id)| *host_id)
+            .collect();
+        for host_id in &host_ids {
+            let _ = erase_ff_effect(fd, *host_id);
+        }
+        self.effects.retain(|(effect_slot, _), _| *effect_slot != slot);
+    }
+
     fn remove_device(&mut self, position: usize) {
         let device = self.devices.remove(position);
-        self.effects.retain(|(slot, _), _| *slot != device.slot);
+        self.stop_effects(device.slot, device.fd);
         self.slots.free(device.slot);
         let _ = self.send(&Message::DeviceRemove { slot: device.slot });
         close_fd(device.fd);
@@ -205,11 +220,19 @@ impl Session {
                 host_id: 0,
             });
         }
+        // The guest replaces an effect by re-uploading it under the same id.
+        // The host gets a new id for every upload, so the old effect would
+        // stay in the controller's table, and an old infinite effect keeps
+        // rumbling with nothing left to stop it. Drop it either way.
+        let previous = self.effects.remove(&(slot, local_id));
         let mut ff: FfEffect = effect.to_effect();
         let result = upload_ff_effect(self.devices[position].fd, &mut ff);
         match result {
             Ok(()) => {
                 let host_id = ff.id as u16;
+                if let Some(previous) = previous.filter(|previous| *previous != host_id) {
+                    let _ = erase_ff_effect(self.devices[position].fd, previous);
+                }
                 self.effects.insert((slot, local_id), host_id);
                 self.send(&Message::FfUploadResp {
                     slot,
@@ -218,12 +241,17 @@ impl Session {
                     host_id,
                 })
             }
-            Err(error) => self.send(&Message::FfUploadResp {
-                slot,
-                local_id,
-                result: -error.raw_os_error().unwrap_or(libc::EIO),
-                host_id: 0,
-            }),
+            Err(error) => {
+                if let Some(previous) = previous {
+                    let _ = erase_ff_effect(self.devices[position].fd, previous);
+                }
+                self.send(&Message::FfUploadResp {
+                    slot,
+                    local_id,
+                    result: -error.raw_os_error().unwrap_or(libc::EIO),
+                    host_id: 0,
+                })
+            }
         }
     }
 
@@ -385,7 +413,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        for device in &self.devices {
+        let devices = std::mem::take(&mut self.devices);
+        for device in devices {
+            self.stop_effects(device.slot, device.fd);
             close_fd(device.fd);
         }
     }
@@ -465,5 +495,41 @@ mod tests {
         slots.free(1);
         assert_eq!(slots.alloc("left"), Some(0));
         assert_eq!(slots.alloc("right"), Some(1));
+    }
+
+    #[test]
+    fn stopping_a_device_clears_only_its_effects() {
+        let mut session = Session::new(-1);
+        session.effects.insert((0, 1), 7);
+        session.effects.insert((1, 1), 8);
+        // The ioctls fail on a closed descriptor, which is fine: this checks
+        // the bookkeeping that decides what would be stopped.
+        session.stop_effects(0, -1);
+        assert!(!session.effects.contains_key(&(0, 1)));
+        assert_eq!(session.effects.get(&(1, 1)), Some(&8));
+    }
+
+    #[test]
+    fn a_reupload_drops_the_previous_host_effect() {
+        let mut session = Session::new(-1);
+        session.devices.push(Device {
+            index: 0,
+            fd: -1,
+            slot: 0,
+            key: "pad".into(),
+        });
+        session.effects.insert((0, 1), 7);
+        session.effects.insert((1, 1), 8);
+        let effect = crate::protocol::FfUploadData {
+            type_: FF_RUMBLE,
+            direction: 0,
+            trigger: Default::default(),
+            replay: Default::default(),
+            strong: 0,
+            weak: 0,
+        };
+        let _ = session.handle_ff_upload(0, 1, &effect);
+        assert!(!session.effects.contains_key(&(0, 1)));
+        assert_eq!(session.effects.get(&(1, 1)), Some(&8));
     }
 }
