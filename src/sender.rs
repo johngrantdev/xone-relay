@@ -186,7 +186,8 @@ impl Session {
         for host_id in &host_ids {
             let _ = erase_ff_effect(fd, *host_id);
         }
-        self.effects.retain(|(effect_slot, _), _| *effect_slot != slot);
+        self.effects
+            .retain(|(effect_slot, _), _| *effect_slot != slot);
     }
 
     fn remove_device(&mut self, position: usize) {
