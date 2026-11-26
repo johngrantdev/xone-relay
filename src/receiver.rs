@@ -11,9 +11,12 @@ use crate::linux::{
     UI_FF_UPLOAD,
 };
 use crate::protocol::{
-    events_are_aligned, read_frame, write_frame, FfUploadData, Message, PROTOCOL_VERSION,
+    events_are_aligned, read_frame, FfUploadData, FrameParser, FrameWriter, Message,
+    PROTOCOL_VERSION,
 };
 use crate::uinput::{create_uinput, destroy_uinput, rename_for_slot, write_uinput};
+
+const MAX_DEFERRED: usize = 1 << 20;
 
 struct UinputDevice {
     fd: RawFd,
@@ -36,6 +39,8 @@ struct Session {
     effects: HashMap<(u8, u16), u16>,
     deferred: HashMap<u8, Vec<u8>>,
     uinput_name: Option<String>,
+    reader: FrameParser,
+    writer: FrameWriter,
 }
 
 impl Session {
@@ -48,11 +53,17 @@ impl Session {
             effects: HashMap::new(),
             deferred: HashMap::new(),
             uinput_name,
+            reader: FrameParser::new(),
+            writer: FrameWriter::new(),
         }
     }
 
-    fn send(&self, message: &Message) -> io::Result<()> {
-        write_frame(self.client, message)
+    fn send(&mut self, message: &Message) -> io::Result<()> {
+        self.writer.queue(message)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush(self.client)
     }
 
     fn remove_device(&mut self, slot: u8) {
@@ -115,9 +126,16 @@ impl Session {
                     // FF upload. Queue input until the host answers, or the
                     // FF response behind it cannot be read.
                     let deferred = self.deferred.entry(slot).or_default();
-                    if deferred.len() < 1 << 20 {
-                        deferred.extend_from_slice(&data);
+                    if deferred.len() + data.len() > MAX_DEFERRED {
+                        // Dropping events would silently strand a button in
+                        // the pressed state. End the session instead: the
+                        // sender reconnects and devices are recreated from a
+                        // known state.
+                        return Err(io::Error::other(format!(
+                            "controller {slot} input backlog overflowed"
+                        )));
                     }
+                    deferred.extend_from_slice(&data);
                     return Ok(());
                 }
                 let Some(fd) = self.devices.get(&slot).map(|device| device.fd) else {
@@ -159,6 +177,11 @@ impl Session {
     }
 
     fn flush_deferred(&mut self, slot: u8) {
+        // Another FF request is still in flight; keep input queued until the
+        // slot is completely idle.
+        if self.slot_busy(slot) {
+            return;
+        }
         let Some(data) = self.deferred.remove(&slot) else {
             return;
         };
@@ -258,6 +281,14 @@ impl Session {
                         continue;
                     }
                     let local_id = request.effect_id as u16;
+                    // A second erase for the same effect must finish the first
+                    // kernel request; otherwise the game's ioctl waits for its
+                    // timeout.
+                    if let Some(old) = self.erases.remove(&(slot, local_id)) {
+                        let mut old = old.request;
+                        old.retval = -libc::EBUSY;
+                        let _ = ioctl_mut(fd, UI_END_FF_ERASE, &mut old);
+                    }
                     self.send(&Message::FfErase { slot, local_id })?;
                     self.erases
                         .insert((slot, local_id), PendingErase { request });
@@ -284,9 +315,13 @@ impl Session {
     fn poll_once(&mut self) -> io::Result<bool> {
         let mut pollfds = Vec::with_capacity(1 + self.devices.len());
         let mut slots = Vec::with_capacity(self.devices.len());
+        let mut client_events = libc::POLLIN;
+        if !self.writer.is_empty() {
+            client_events |= libc::POLLOUT;
+        }
         pollfds.push(libc::pollfd {
             fd: self.client,
-            events: libc::POLLIN,
+            events: client_events,
             revents: 0,
         });
         for (slot, device) in &self.devices {
@@ -303,19 +338,25 @@ impl Session {
         if ret < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
+                self.flush()?;
                 return Ok(true);
             }
             return Err(error);
         }
         if ret == 0 {
+            self.flush()?;
             return Ok(true);
         }
 
-        if pollfds[0].revents != 0 {
-            match read_frame(self.client) {
-                Ok(message) => self.handle_message(message)?,
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-                Err(error) => return Err(error),
+        let client = pollfds[0].revents;
+        if client & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            let open = self.reader.read_from(self.client)?;
+            while let Some(message) = self.reader.next()? {
+                self.handle_message(message)?;
+            }
+            if !open {
+                let _ = self.flush();
+                return Ok(false);
             }
         }
 
@@ -336,6 +377,9 @@ impl Session {
                 let error = io::Error::last_os_error();
                 match error.raw_os_error() {
                     Some(libc::EINTR) => continue,
+                    // The descriptor is non-blocking. A stale poll result or
+                    // a replaced device can leave it readable without data.
+                    Some(libc::EAGAIN) => continue,
                     Some(libc::ENODEV) => {
                         remove.push(*slot);
                         continue;
@@ -356,6 +400,7 @@ impl Session {
         for slot in remove {
             self.remove_device(slot);
         }
+        self.flush()?;
         Ok(true)
     }
 

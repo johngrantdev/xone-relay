@@ -5,11 +5,13 @@ use std::time::{Duration, Instant};
 
 use crate::config::{Config, DEFAULT_DEVICE_NAME};
 use crate::linux::{
-    close_fd, connect_tcp, erase_ff_effect, open_event_rw, read_device_info, sysfs_device_name,
-    tcp_tune, upload_ff_effect, write_ff_event, FfEffect, EVENT_SIZE, FF_AUTOCENTER, FF_GAIN,
-    FF_RUMBLE,
+    append_event, bit_is_set, close_fd, connect_tcp, erase_ff_effect, eviocgabs,
+    input_event_indices, ioctl_mut, open_event_rw, read_device_info, read_key_state,
+    sysfs_device_name, tcp_tune, upload_ff_effect, write_ff_event, DeviceInfo, FfEffect,
+    InputAbsInfo, EVENT_SIZE, EV_ABS, EV_KEY, EV_SYN, FF_AUTOCENTER, FF_GAIN, FF_RUMBLE,
+    SYN_DROPPED, SYN_REPORT,
 };
-use crate::protocol::{events_are_aligned, read_frame, write_frame, Message, PROTOCOL_VERSION};
+use crate::protocol::{events_are_aligned, FrameParser, FrameWriter, Message, PROTOCOL_VERSION};
 
 const MAX_CONTROLLERS: usize = 8;
 const SCAN_INTERVAL: Duration = Duration::from_secs(1);
@@ -79,6 +81,7 @@ struct Device {
     fd: RawFd,
     slot: u8,
     key: String,
+    info: DeviceInfo,
 }
 
 struct Session {
@@ -86,6 +89,8 @@ struct Session {
     devices: Vec<Device>,
     slots: SlotAllocator,
     effects: HashMap<(u8, u16), u16>,
+    reader: FrameParser,
+    writer: FrameWriter,
 }
 
 impl Session {
@@ -95,11 +100,17 @@ impl Session {
             devices: Vec::new(),
             slots: SlotAllocator::new(),
             effects: HashMap::new(),
+            reader: FrameParser::new(),
+            writer: FrameWriter::new(),
         }
     }
 
-    fn send(&self, message: &Message) -> io::Result<()> {
-        write_frame(self.client, message)
+    fn send(&mut self, message: &Message) -> io::Result<()> {
+        self.writer.queue(message)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush(self.client)
     }
 
     fn device(&self, slot: u8) -> Option<&Device> {
@@ -107,7 +118,7 @@ impl Session {
     }
 
     fn scan(&mut self, filter: &str) -> io::Result<()> {
-        for index in 0..=255u32 {
+        for index in input_event_indices() {
             if self.devices.iter().any(|device| device.index == index) {
                 continue;
             }
@@ -147,29 +158,51 @@ impl Session {
                 eprintln!("xone-relay-sender: no free controller slot");
                 continue;
             };
+            let device = Device {
+                index,
+                fd,
+                slot,
+                key,
+                info,
+            };
             if let Err(error) = self.send(&Message::DeviceAdd {
                 slot,
-                info: info.clone(),
+                info: device.info.clone(),
             }) {
                 close_fd(fd);
                 self.slots.free(slot);
                 return Err(error);
             }
+            // A button may already be held when the receiver creates the
+            // device; start from the controller's current state instead of
+            // waiting for the next change.
+            match state_snapshot(&device) {
+                Ok(data) => {
+                    if let Err(error) = self.send(&Message::Events { slot, data }) {
+                        close_fd(device.fd);
+                        self.slots.free(slot);
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("xone-relay-sender: input{index}: read state: {error}");
+                }
+            }
             eprintln!(
-                "xone-relay-sender: controller {slot} {name} ({key}){}{}",
+                "xone-relay-sender: controller {slot} {name} ({}){}{}",
+                device.key,
                 if writable {
                     ""
                 } else {
                     " (read-only: rumble disabled)"
                 },
-                if info.ff.is_empty() { " (no FF)" } else { "" }
+                if device.info.ff.is_empty() {
+                    " (no FF)"
+                } else {
+                    ""
+                }
             );
-            self.devices.push(Device {
-                index,
-                fd,
-                slot,
-                key,
-            });
+            self.devices.push(device);
         }
         Ok(())
     }
@@ -316,9 +349,13 @@ impl Session {
 
     fn poll_once(&mut self) -> io::Result<bool> {
         let mut pollfds = Vec::with_capacity(1 + self.devices.len());
+        let mut client_events = libc::POLLIN;
+        if !self.writer.is_empty() {
+            client_events |= libc::POLLOUT;
+        }
         pollfds.push(libc::pollfd {
             fd: self.client,
-            events: libc::POLLIN,
+            events: client_events,
             revents: 0,
         });
         for device in &self.devices {
@@ -334,19 +371,25 @@ impl Session {
         if ret < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
+                self.flush()?;
                 return Ok(true);
             }
             return Err(error);
         }
         if ret == 0 {
+            self.flush()?;
             return Ok(true);
         }
 
-        if pollfds[0].revents != 0 {
-            match read_frame(self.client) {
-                Ok(message) => self.handle_client_message(message)?,
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-                Err(error) => return Err(error),
+        let client = pollfds[0].revents;
+        if client & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            let open = self.reader.read_from(self.client)?;
+            while let Some(message) = self.reader.next()? {
+                self.handle_client_message(message)?;
+            }
+            if !open {
+                let _ = self.flush();
+                return Ok(false);
             }
         }
 
@@ -382,6 +425,29 @@ impl Session {
                 continue;
             }
             debug_assert!(events_are_aligned(&buffer[..whole]));
+            // A full evdev queue drops events and leaves SYN_DROPPED. The
+            // client would otherwise keep the last state it saw, which can be
+            // a held button whose release was dropped. Replace the batch with
+            // a snapshot of the controller's real state.
+            if has_syn_dropped(&buffer[..whole]) {
+                match state_snapshot(&self.devices[position]) {
+                    Ok(data) => self.send(&Message::Events {
+                        slot: self.devices[position].slot,
+                        data,
+                    })?,
+                    Err(error) => {
+                        eprintln!(
+                            "xone-relay-sender: input{}: resync: {error}",
+                            self.devices[position].index
+                        );
+                        self.send(&Message::Events {
+                            slot: self.devices[position].slot,
+                            data: buffer[..whole].to_vec(),
+                        })?;
+                    }
+                }
+                continue;
+            }
             self.send(&Message::Events {
                 slot: self.devices[position].slot,
                 data: buffer[..whole].to_vec(),
@@ -391,6 +457,7 @@ impl Session {
         for position in remove.into_iter().rev() {
             self.remove_device(position);
         }
+        self.flush()?;
         Ok(true)
     }
 
@@ -420,6 +487,45 @@ impl Drop for Session {
             close_fd(device.fd);
         }
     }
+}
+
+/// True when an evdev read lost events and the kernel left a marker.
+fn has_syn_dropped(data: &[u8]) -> bool {
+    data.as_chunks::<EVENT_SIZE>().0.iter().any(|chunk| {
+        // SAFETY: chunk is exactly EVENT_SIZE bytes and read_unaligned does
+        // not require alignment.
+        let event: crate::linux::InputEvent =
+            unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const _) };
+        event.type_ == EV_SYN && event.code == SYN_DROPPED
+    })
+}
+
+/// Build a complete EV_KEY/EV_ABS snapshot for a device.
+///
+/// Every supported key is reported, so a release lost by evdev is corrected
+/// instead of leaving a button held. The trailing SYN_REPORT lets the receiver
+/// apply the snapshot as one atomic update.
+fn state_snapshot(device: &Device) -> io::Result<Vec<u8>> {
+    let keys = read_key_state(device.fd, device.info.key.len())?;
+    let mut data = Vec::with_capacity((device.info.key.len() + device.info.abs.len()) * 8 + 24);
+    for code in 0..device.info.key.len() * 8 {
+        if !bit_is_set(&device.info.key, code) {
+            continue;
+        }
+        append_event(
+            &mut data,
+            EV_KEY,
+            code as u16,
+            i32::from(bit_is_set(&keys, code)),
+        );
+    }
+    for (code, _) in &device.info.abs {
+        let mut abs = InputAbsInfo::default();
+        ioctl_mut(device.fd, eviocgabs(*code), &mut abs)?;
+        append_event(&mut data, EV_ABS, *code, abs.value);
+    }
+    append_event(&mut data, EV_SYN, SYN_REPORT, 0);
+    Ok(data)
 }
 
 pub fn run_sender(
@@ -499,6 +605,74 @@ mod tests {
     }
 
     #[test]
+    fn a_device_batch_is_forwarded_as_one_message() {
+        let mut socket = [0; 2];
+        // SAFETY: socket is writable for two descriptors.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, socket.as_mut_ptr()) },
+            0
+        );
+        let mut pipe = [0; 2];
+        // SAFETY: pipe is writable for two descriptors.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+
+        let mut session = Session::new(socket[0]);
+        session.devices.push(Device {
+            index: 0,
+            fd: pipe[0],
+            slot: 0,
+            key: "pad".into(),
+            info: DeviceInfo::default(),
+        });
+        // Two EV_SYN/SYN_REPORT records are enough to prove the bytes are
+        // forwarded unchanged.
+        let events = [0u8; EVENT_SIZE * 2];
+        // SAFETY: pipe[1] is open for writing and events is readable.
+        assert_eq!(
+            unsafe {
+                libc::write(
+                    pipe[1],
+                    events.as_ptr() as *const libc::c_void,
+                    events.len(),
+                )
+            },
+            events.len() as isize
+        );
+
+        assert!(session.poll_once().expect("poll"));
+
+        let mut parser = FrameParser::new();
+        assert!(parser.read_from(socket[1]).expect("read"));
+        match parser.next().expect("parse") {
+            Some(Message::Events {
+                slot,
+                data: decoded,
+            }) => {
+                assert_eq!(slot, 0);
+                assert_eq!(decoded, events);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        drop(session);
+        // SAFETY: all remaining descriptors are open and owned by this test.
+        unsafe {
+            libc::close(socket[1]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    #[test]
+    fn syn_dropped_marks_a_lost_batch() {
+        let mut data = Vec::new();
+        append_event(&mut data, EV_SYN, SYN_REPORT, 0);
+        assert!(!has_syn_dropped(&data));
+        append_event(&mut data, EV_SYN, SYN_DROPPED, 0);
+        assert!(has_syn_dropped(&data));
+        assert!(!has_syn_dropped(&data[..EVENT_SIZE]));
+    }
+
+    #[test]
     fn stopping_a_device_clears_only_its_effects() {
         let mut session = Session::new(-1);
         session.effects.insert((0, 1), 7);
@@ -518,6 +692,7 @@ mod tests {
             fd: -1,
             slot: 0,
             key: "pad".into(),
+            info: DeviceInfo::default(),
         });
         session.effects.insert((0, 1), 7);
         session.effects.insert((1, 1), 8);

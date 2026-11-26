@@ -13,11 +13,15 @@ pub const ABS_BITMAP_LEN: usize = 8;
 pub const FF_BITMAP_LEN: usize = 16;
 pub const MSC_BITMAP_LEN: usize = 1;
 
+pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
 pub const EV_ABS: u16 = 0x03;
 pub const EV_MSC: u16 = 0x04;
 pub const EV_FF: u16 = 0x15;
 pub const EV_UINPUT: u16 = 0x0101;
+
+pub const SYN_REPORT: u16 = 0;
+pub const SYN_DROPPED: u16 = 3;
 
 pub const UI_FF_UPLOAD: u16 = 1;
 pub const UI_FF_ERASE: u16 = 2;
@@ -61,7 +65,11 @@ pub const fn eviocgbit(event_type: u16, len: usize) -> libc::Ioctl {
     ioc(IOC_READ, b'E', 0x20 + event_type as u8, len)
 }
 
-const fn eviocgabs(abs: u16) -> libc::Ioctl {
+pub fn eviocgkey(len: usize) -> libc::Ioctl {
+    ioc(IOC_READ, b'E', 0x18, len)
+}
+
+pub const fn eviocgabs(abs: u16) -> libc::Ioctl {
     ior(b'E', 0x40 + abs as u8, mem::size_of::<InputAbsInfo>())
 }
 
@@ -139,6 +147,18 @@ impl InputEvent {
             value,
         }
     }
+}
+
+/// Append one `input_event` record in the kernel's wire layout.
+pub fn append_event(out: &mut Vec<u8>, type_: u16, code: u16, value: i32) {
+    let event = InputEvent::new(type_, code, value);
+    // SAFETY: `event` is a live InputEvent and the slice covers its bytes.
+    out.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &event as *const InputEvent as *const u8,
+            mem::size_of::<InputEvent>(),
+        )
+    });
 }
 
 #[repr(C)]
@@ -347,33 +367,6 @@ pub fn ignore_sigpipe() {
     }
 }
 
-pub fn send_all(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
-    while !data.is_empty() {
-        // SAFETY: `data` covers `len` readable bytes and `fd` is an open socket.
-        let ret = unsafe {
-            libc::send(
-                fd,
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if ret > 0 {
-            data = &data[ret as usize..];
-            continue;
-        }
-        if ret == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "send returned 0"));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
 pub fn write_all(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
         // SAFETY: `data` covers `len` readable bytes and `fd` is open for writing.
@@ -457,6 +450,32 @@ pub fn sysfs_device_name(index: u32) -> Option<String> {
         .map(|name| name.trim().to_string())
 }
 
+/// Every event node currently known to the input class.
+///
+/// Reading the class directory once is much cheaper than probing
+/// `/dev/input/event0..255` every scan, and it does not touch nodes that are
+/// in the middle of being removed.
+pub fn input_event_indices() -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/input") else {
+        return Vec::new();
+    };
+    let mut indices = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(index) = name.strip_prefix("event") else {
+            continue;
+        };
+        if let Ok(index) = index.parse::<u32>() {
+            indices.push(index);
+        }
+    }
+    indices.sort_unstable();
+    indices
+}
+
 pub fn device_phys(fd: RawFd) -> String {
     device_string(fd, 0x07)
 }
@@ -473,6 +492,17 @@ pub fn read_bitmap(fd: RawFd, event_type: u16, len: usize) -> Vec<u8> {
         bitmap.clear();
     }
     bitmap
+}
+
+/// The keys that are currently pressed on an evdev device.
+pub fn read_key_state(fd: RawFd, len: usize) -> io::Result<Vec<u8>> {
+    let mut bitmap = vec![0u8; len];
+    if len == 0 {
+        return Ok(bitmap);
+    }
+    // SAFETY: `bitmap` is writable for `len` bytes and the request matches it.
+    cvt(unsafe { libc::ioctl(fd, eviocgkey(len), bitmap.as_mut_ptr()) })?;
+    Ok(bitmap)
 }
 
 pub fn bit_is_set(bitmap: &[u8], bit: usize) -> bool {
@@ -548,8 +578,15 @@ pub fn erase_ff_effect(fd: RawFd, effect_id: u16) -> io::Result<()> {
 
 pub fn open_uinput() -> io::Result<RawFd> {
     let path = CString::new("/dev/uinput").expect("static path");
+    // O_NONBLOCK keeps a stale poll result from turning into a blocking read;
+    // uinput writes still take the device mutex and are unaffected.
     // SAFETY: `path` is a static NUL-terminated C string.
-    cvt(unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) })
+    cvt(unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    })
 }
 
 pub fn connect_tcp(host: &str, port: u16) -> io::Result<RawFd> {

@@ -49,6 +49,8 @@ graph LR
 - **Rumble:** force feedback from games is relayed back to the controller.
 - **Reconnects:** a sleeping controller, a replugged adapter, or a restarted
   receiver recovers without restarting the relay.
+- **Loss recovery:** if the host's input buffer overflows, the relay resends the
+  full controller state instead of leaving a button stuck.
 - **Low latency:** responsive input over a wired local network.
 - **Self-contained:** one static binary and one small configuration file. The
   receiver needs no Python, evdev, or udev runtime packages.

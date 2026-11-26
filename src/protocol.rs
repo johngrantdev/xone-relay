@@ -2,10 +2,15 @@ use std::io;
 use std::os::fd::RawFd;
 
 use crate::linux::{
-    read_exact_fd, send_all, DeviceInfo, FfEffect, FfEffectU, FfReplay, FfRumbleEffect, FfTrigger,
+    read_exact_fd, DeviceInfo, FfEffect, FfEffectU, FfReplay, FfRumbleEffect, FfTrigger,
     InputAbsInfo, InputId, ABS_BITMAP_LEN, EVENT_SIZE, FF_BITMAP_LEN, FF_RUMBLE, KEY_BITMAP_LEN,
     MSC_BITMAP_LEN,
 };
+
+// Refuse to queue more than this for a peer that has stopped reading. Input
+// keeps flowing while the socket is backed up, but a peer that is gone for
+// long enough has to be reconnected rather than growing without bound.
+const MAX_QUEUED: usize = 4 << 20;
 
 pub const MAGIC: u32 = 0x594c_5258;
 // The magic bytes are "XRLY" in little-endian order.
@@ -298,8 +303,147 @@ pub fn read_frame(fd: RawFd) -> io::Result<Message> {
     Message::decode(&body).map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
-pub fn write_frame(fd: RawFd, message: &Message) -> io::Result<()> {
-    send_all(fd, &message.encode_frame())
+/// Buffers bytes from a non-blocking socket and yields complete frames.
+#[derive(Default)]
+pub struct FrameParser {
+    buffer: Vec<u8>,
+    head: usize,
+}
+
+impl FrameParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+    }
+
+    /// Read one chunk from a non-blocking socket.
+    ///
+    /// Returns `false` when the peer closed the connection. Processing one
+    /// chunk per poll keeps a backlogged link from monopolising the loop.
+    pub fn read_from(&mut self, fd: RawFd) -> io::Result<bool> {
+        let mut chunk = [0u8; 65536];
+        loop {
+            // SAFETY: chunk is writable for its length and fd is an open socket.
+            let ret = unsafe {
+                libc::recv(
+                    fd,
+                    chunk.as_mut_ptr() as *mut libc::c_void,
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if ret > 0 {
+                self.push(&chunk[..ret as usize]);
+                return Ok(true);
+            }
+            if ret == 0 {
+                return Ok(false);
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(true),
+                _ => return Err(error),
+            }
+        }
+    }
+
+    pub fn next(&mut self) -> io::Result<Option<Message>> {
+        let available = &self.buffer[self.head..];
+        if available.len() < 4 {
+            return Ok(None);
+        }
+        let len =
+            u32::from_le_bytes([available[0], available[1], available[2], available[3]]) as usize;
+        if len == 0 || len > MAX_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad frame length",
+            ));
+        }
+        if available.len() < 4 + len {
+            return Ok(None);
+        }
+        let message = Message::decode(&available[4..4 + len])
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+        self.head += 4 + len;
+        if self.head == self.buffer.len() {
+            self.buffer.clear();
+            self.head = 0;
+        } else if self.head >= 1 << 16 {
+            self.buffer.drain(..self.head);
+            self.head = 0;
+        }
+        Ok(Some(message))
+    }
+}
+
+/// Queues frames and writes as much as the socket accepts without blocking.
+#[derive(Default)]
+pub struct FrameWriter {
+    buffer: Vec<u8>,
+    head: usize,
+}
+
+impl FrameWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.head == self.buffer.len()
+    }
+
+    pub fn queue(&mut self, message: &Message) -> io::Result<()> {
+        let frame = message.encode_frame();
+        if self.buffer.len() - self.head + frame.len() > MAX_QUEUED {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "peer is not reading",
+            ));
+        }
+        self.buffer.extend_from_slice(&frame);
+        Ok(())
+    }
+
+    pub fn flush(&mut self, fd: RawFd) -> io::Result<()> {
+        while self.head < self.buffer.len() {
+            let data = &self.buffer[self.head..];
+            // SAFETY: data covers len readable bytes and fd is an open socket.
+            let ret = unsafe {
+                libc::send(
+                    fd,
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                    libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                )
+            };
+            if ret > 0 {
+                self.head += ret as usize;
+                continue;
+            }
+            if ret == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "send returned 0"));
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => break,
+                _ => return Err(error),
+            }
+        }
+        if self.head == self.buffer.len() {
+            self.buffer.clear();
+            self.head = 0;
+        } else if self.head >= 1 << 16 {
+            self.buffer.drain(..self.head);
+            self.head = 0;
+        }
+        Ok(())
+    }
 }
 
 fn put_u16(out: &mut Vec<u8>, value: u16) {
@@ -647,5 +791,75 @@ mod tests {
         assert!(events_are_aligned(&[0u8; EVENT_SIZE * 3]));
         assert!(!events_are_aligned(&[]));
         assert!(!events_are_aligned(&[0u8; EVENT_SIZE - 1]));
+    }
+
+    #[test]
+    fn parser_waits_for_a_complete_frame() {
+        let frame = Message::DeviceRemove { slot: 3 }.encode_frame();
+        let mut parser = FrameParser::new();
+        parser.push(&frame[..2]);
+        assert!(parser.next().expect("parse").is_none());
+        parser.push(&frame[2..5]);
+        assert!(parser.next().expect("parse").is_none());
+        parser.push(&frame[5..]);
+        match parser.next().expect("parse") {
+            Some(Message::DeviceRemove { slot }) => assert_eq!(slot, 3),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parser.next().expect("parse").is_none());
+    }
+
+    #[test]
+    fn parser_returns_every_buffered_frame() {
+        let mut bytes = Message::DeviceRemove { slot: 1 }.encode_frame();
+        bytes.extend_from_slice(&Message::DeviceRemove { slot: 2 }.encode_frame());
+        let mut parser = FrameParser::new();
+        parser.push(&bytes);
+        for slot in [1, 2] {
+            match parser.next().expect("parse") {
+                Some(Message::DeviceRemove { slot: decoded }) => assert_eq!(decoded, slot),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(parser.next().expect("parse").is_none());
+    }
+
+    #[test]
+    fn parser_rejects_a_bad_frame_length() {
+        let mut frame = Message::DeviceRemove { slot: 1 }.encode_frame();
+        frame[..4].copy_from_slice(&0u32.to_le_bytes());
+        let mut parser = FrameParser::new();
+        parser.push(&frame);
+        assert!(parser.next().is_err());
+    }
+
+    #[test]
+    fn writer_flushes_a_complete_frame() {
+        let mut fds = [0; 2];
+        // SAFETY: fds is writable for two descriptors.
+        let ret =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(ret, 0);
+
+        let mut writer = FrameWriter::new();
+        writer
+            .queue(&Message::DeviceRemove { slot: 9 })
+            .expect("queue");
+        assert!(!writer.is_empty());
+        writer.flush(fds[0]).expect("flush");
+        assert!(writer.is_empty());
+
+        let mut parser = FrameParser::new();
+        assert!(parser.read_from(fds[1]).expect("read"));
+        match parser.next().expect("parse") {
+            Some(Message::DeviceRemove { slot }) => assert_eq!(slot, 9),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // SAFETY: both descriptors are open and owned by this test.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 }
